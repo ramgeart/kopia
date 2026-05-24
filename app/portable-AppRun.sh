@@ -106,7 +106,10 @@ if [ "$IS_MUSL" = "1" ]; then
         EXTRA_ARGS="$EXTRA_ARGS --no-sandbox"
     fi
     if [ "${KOPIA_PORTABLE_FORCE_GPU:-0}" != "1" ]; then
-        EXTRA_ARGS="$EXTRA_ARGS --disable-gpu --disable-software-rasterizer"
+        # --disable-gpu makes Chromium fall back to software rasterization,
+        # which is fine for a backup-tool UI and avoids needing host DRI
+        # drivers that match the bundled Mesa.
+        EXTRA_ARGS="$EXTRA_ARGS --disable-gpu"
     fi
 fi
 

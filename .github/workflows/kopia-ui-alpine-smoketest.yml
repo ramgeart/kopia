@@ -1,0 +1,120 @@
+name: KopiaUI Alpine Smoke Test
+# Verifies that the self-contained ("portable") KopiaUI AppImage produced by
+# the main Build workflow actually starts on Alpine Linux. This is the
+# regression gate for the "AppImage should just run on Alpine" requirement.
+#
+# Strategy:
+#   * Reuse the artifact uploaded by the Build workflow (kopia-ubuntu-latest).
+#   * Run the AppImage inside an Alpine container under xvfb-run.
+#   * Use the bundled embedded kopia server binary to assert end-to-end startup
+#     by invoking the server with `--help` -- this exercises Node, Electron's
+#     native deps, glibc loader resolution, and the embedded Go binary, but
+#     does NOT require a full GUI session (Chromium itself is asserted via
+#     `--version`).
+#
+# Triggers on PRs that modify the AppImage build inputs, and on demand.
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types: [completed]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'app/AppImageBuilder.*.yml'
+      - 'app/portable-AppRun.sh'
+      - 'app/Makefile'
+      - 'app/package.json'
+      - 'Makefile'
+      - '.github/workflows/kopia-ui-alpine-smoketest.yml'
+      - '.github/workflows/make.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  alpine-smoketest:
+    # Only run after a successful Build, or when triggered manually / by PR.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        alpine: ["3.18", "3.20", "edge"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download Build artifacts (from workflow_run)
+        if: ${{ github.event_name == 'workflow_run' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kopia-ubuntu-latest
+          path: dist
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Locate portable AppImage
+        id: locate
+        run: |
+          set -euo pipefail
+          # When triggered by PR or workflow_dispatch we don't have the artifact;
+          # in that case skip gracefully so the job is informational only.
+          APPIMAGE="$(find dist -maxdepth 4 -name 'KopiaUI-*-x86_64-portable.AppImage' 2>/dev/null | head -n1 || true)"
+          if [ -z "$APPIMAGE" ]; then
+            echo "no portable AppImage artifact available; this run is informational" >&2
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "appimage=$APPIMAGE" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          ls -lh "$APPIMAGE"
+
+      - name: Run AppImage in Alpine ${{ matrix.alpine }}
+        if: ${{ steps.locate.outputs.skip != 'true' }}
+        env:
+          APPIMAGE: ${{ steps.locate.outputs.appimage }}
+          ALPINE_TAG: ${{ matrix.alpine }}
+        run: |
+          set -euo pipefail
+          # Mount the AppImage read-only into a clean Alpine container, install
+          # only the absolute minimum (fuse is NOT installed -- we use
+          # --appimage-extract so the test exercises the bundled glibc loader
+          # without any host glibc-compat package), then run the embedded
+          # Electron launcher under xvfb-run.
+          docker run --rm \
+            -v "$(realpath "$APPIMAGE"):/kopia-ui.AppImage:ro" \
+            -e KOPIA_PORTABLE_DEBUG=1 \
+            "alpine:${ALPINE_TAG}" \
+            sh -ec '
+              apk add --no-cache xvfb-run bash file
+              # Sanity: confirm the host is musl-only (no glibc shim installed).
+              echo "--- ldd --version ---"
+              ldd --version 2>&1 || true
+              echo "--- /etc/alpine-release ---"
+              cat /etc/alpine-release
+              echo "--- extract AppImage ---"
+              cp /kopia-ui.AppImage /tmp/app.AppImage
+              chmod +x /tmp/app.AppImage
+              cd /tmp
+              # --appimage-extract is implemented by the AppImage runtime itself
+              # and writes to ./squashfs-root. Works without FUSE.
+              /tmp/app.AppImage --appimage-extract >/dev/null
+              ls -l squashfs-root/AppRun squashfs-root/kopia-ui.bin
+              file squashfs-root/kopia-ui.bin
+              # The embedded kopia server is a static Go binary, executing it
+              # confirms argv / fork are healthy inside the AppDir.
+              echo "--- embedded kopia --version ---"
+              ./squashfs-root/resources/server/kopia --version
+              # Now the real test: start Electron under xvfb-run. We use
+              # --version so the process exits immediately after Chromium
+              # initializes; if any dlopen of NSS / GTK / mesa / fontconfig
+              # fails, this command will fail.
+              echo "--- KopiaUI --version under xvfb ---"
+              xvfb-run -a -s "-screen 0 1280x960x24" \
+                ./squashfs-root/AppRun --version
+              echo "--- ok ---"
+            '

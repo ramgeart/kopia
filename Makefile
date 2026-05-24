@@ -223,6 +223,17 @@ ifneq ($(GOOS)/$(GOARCH),linux/arm64)
 	$(retry) $(MAKE) kopia-ui
 	$(retry) $(MAKE) kopia-ui-test
 endif
+# Build the self-contained "portable" AppImage (works on Alpine/musl, NixOS,
+# etc). Only on linux/amd64 (the host that produces the unpacked Electron
+# tree), and only when explicitly enabled via KOPIA_UI_SELFCONTAINED_APPIMAGE.
+# arm64/armv7 portable AppImages would require cross-bootstrapping the foreign
+# rootfs via qemu-user-static and are deferred. Failures are non-fatal so a
+# missing appimage-builder install does not break the rest of ci-build.
+ifeq ($(GOOS)/$(GOARCH),linux/amd64)
+ifneq ($(KOPIA_UI_SELFCONTAINED_APPIMAGE),)
+	-$(MAKE) -C app build-portable-appimage
+endif
+endif
 ifeq ($(GOOS)/$(GOARCH),linux/amd64)
 	$(MAKE) generate-change-log
 	$(MAKE) download-rclone

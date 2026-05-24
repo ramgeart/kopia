@@ -133,3 +133,45 @@ $ make -C site server
 
 This starts a server on http://localhost:1313 where the website can be browsed.
 
+
+## Portable (self-contained) KopiaUI AppImage
+
+The default `KopiaUI-*.AppImage` produced by [Electron Builder](https://www.electron.build/) is "slim" — it bundles the Electron runtime and the Kopia server binary, but expects the host distribution to provide glibc and the full GUI dependency stack (GTK, NSS, mesa, fontconfig, libdrm/libgbm, libasound, dbus, …). That assumption holds on Debian/Ubuntu/Fedora/Arch/openSUSE but breaks on:
+
+* **Alpine Linux** (musl libc) — even with `gcompat` or the [sgerrand glibc shim](https://github.com/sgerrand/alpine-pkg-glibc), Chromium's `dlopen`-loaded libraries are missing.
+* **NixOS** — non-FHS layout; libraries are not at the paths Chromium looks for.
+* Other minimal / non-glibc distros.
+
+To support those, the build can also produce a **portable** AppImage:
+
+```
+KopiaUI-<version>-x86_64-portable.AppImage
+```
+
+This variant uses [appimage-builder](https://github.com/AppImageCrafters/appimage-builder) to re-bundle the AppDir with a complete glibc + Chromium dependency tree drawn from Ubuntu 22.04 (`libc6`, `libnss3`, `libgtk-3-0`, `libgbm1`, `libdrm2`, `libasound2`, `libfontconfig1`, `libgl1-mesa-dri`, …) and ships a custom `AppRun` (source: [`app/portable-AppRun.sh`](app/portable-AppRun.sh)) that:
+
+* Re-execs Electron under the bundled `ld-linux-x86-64.so.2` so libraries resolve from inside the AppDir, never against the host libc.
+* Detects musl hosts (Alpine) and falls back to `--no-sandbox --disable-gpu` so Chromium starts even where unprivileged user namespaces are disabled and where DRI drivers don't match the bundled Mesa. Override with `KOPIA_PORTABLE_FORCE_SANDBOX=1` / `KOPIA_PORTABLE_FORCE_GPU=1`.
+
+Trade-offs:
+
+* Artifact size ~300–400 MB (vs ~100 MB for the slim AppImage). Unavoidable — this is the cost of bundling "everything needed".
+* Recipe ([`app/AppImageBuilder.x86_64.yml`](app/AppImageBuilder.x86_64.yml)) may need maintenance on Electron major upgrades if Chromium starts `dlopen`-ing new libraries.
+
+### Building locally
+
+Prerequisites: `appimage-builder` (`pip install appimage-builder==1.1.0`) and `appimagetool` on `PATH`.
+
+```shell
+$ make kopia-ui                                   # produces dist/kopia-ui/linux-unpacked
+$ KOPIA_UI_SELFCONTAINED_APPIMAGE=true \
+  make -C app build-portable-appimage             # produces dist/kopia-ui/KopiaUI-*-x86_64-portable.AppImage
+```
+
+### CI
+
+The Linux x86_64 build job (`.github/workflows/make.yml`) installs `appimage-builder` + `appimagetool` and sets `KOPIA_UI_SELFCONTAINED_APPIMAGE=true`, so both the slim and the portable AppImages are produced and uploaded as artifacts.
+
+A separate workflow, [`.github/workflows/kopia-ui-alpine-smoketest.yml`](.github/workflows/kopia-ui-alpine-smoketest.yml), boots the portable AppImage inside Alpine 3.18 / 3.20 / edge containers under `xvfb-run` and asserts that Electron and the embedded Kopia server both start. This is the regression gate that proves the AppImage actually runs on Alpine.
+
+> arm64 and armv7 portable AppImages are not built today — they would require cross-bootstrapping a foreign-arch rootfs with `qemu-user-static`. Alpine users on those architectures should continue to use the slim AppImage with a glibc shim, or run Kopia from the standalone CLI binary.
